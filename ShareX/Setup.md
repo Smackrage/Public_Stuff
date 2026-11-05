@@ -84,7 +84,7 @@ powershell.exe -ExecutionPolicy Bypass -Command "& 'C:\temp\Invoke-ShareXRename_
 ```
 
 - Adjust the days, start hour and runs per day as needed. Runs are spread evenly from the start hour towards midnight.
-- Look for the log line `Scheduled tasks will run as: DATA3\<standard user>`. If it names any other account, stop and re-run with `-TaskUser 'DATA3\<standarduser>'`.
+- Look for the log line `Scheduled tasks will run as: domain\<standard user>`. If it names any other account, stop and re-run with `-TaskUser domain\<standarduser>'`.
 - Only pass `-ScreenshotFolder` if the ShareX folder is not the default. Passing it bakes the path into the task.
 - Re-running a setup command overwrites the existing task.
 
