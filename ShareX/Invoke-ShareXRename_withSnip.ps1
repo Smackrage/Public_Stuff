@@ -33,6 +33,14 @@
     The API key is read from -ApiKey, then the ANTHROPIC_API_KEY environment variable
     (Process, User, then Machine scope). It is never written into a scheduled task.
 
+    STANDARD ACCOUNT PLUS SEPARATE ADMIN ACCOUNT
+        Run the -Setup* switches from the elevated admin session. The tasks are registered to
+        run as the standard (console) user, not the admin, so they use the standard user's
+        profile, clipboard and environment. -ScreenshotFolder is only baked into a task when
+        you pass it explicitly; otherwise each task works out the standard user's own
+        default folder when it runs. The API key must be visible to the standard user: set it
+        at User scope while logged on as that user (non-elevated), or at Machine scope.
+
 .PARAMETER ScreenshotFolder
     ShareX screenshot root folder. Default: "$env:USERPROFILE\Documents\ShareX\Screenshots".
 
@@ -78,6 +86,12 @@
 .PARAMETER TaskName
     Name of the scheduled rename task. Default: ShareXRename.
 
+.PARAMETER TaskUser
+    Account the scheduled tasks run as (DOMAIN\username). Default: the interactively
+    logged-on console user, falling back to the current Windows identity. Environment
+    variables are deliberately not used. SYSTEM and machine accounts are refused, because
+    the tasks need your own session and clipboard.
+
 .EXAMPLE
     .\Invoke-ShareXRename.ps1
     Rename run against the default ShareX folder.
@@ -101,7 +115,7 @@
 .NOTES
     Author:  Marty Smith
     Date:    2026-11-05
-    Version: 3.0
+    Version: 3.2
     Requires: Windows PowerShell 5.1, internet access to api.anthropic.com.
     The script is pure ASCII. Save it as a .ps1 file before using the task options.
 #>
@@ -145,6 +159,10 @@ Param (
 
     [Parameter(ParameterSetName = 'WatcherTask', Mandatory = $True)]
     [switch] $SetupWatcherTask,
+
+    [Parameter(ParameterSetName = 'WatcherTask')]
+    [Parameter(ParameterSetName = 'Schedule')]
+    [string] $TaskUser,
 
     [Parameter(ParameterSetName = 'Schedule', Mandatory = $True)]
     [switch] $SetupScheduledTask,
@@ -822,7 +840,91 @@ Function Start-ClipboardWatcher {
 
 <#
 .SYNOPSIS
-    Registers (or overwrites) a scheduled task under \ShareXRename\ for the current user.
+    Works out which account the scheduled tasks should run as.
+
+.DESCRIPTION
+    Order of preference: -TaskUser, the interactively logged-on console user, then the
+    current Windows identity. Environment variables are not used because they can be wrong
+    in elevated sessions. SYSTEM, service and machine accounts are refused: the tasks need
+    your own session (and clipboard).
+
+.PARAMETER TaskUser
+    Optional DOMAIN\username supplied by the caller.
+
+.OUTPUTS
+    [string] The account name.
+#>
+Function Resolve-TaskUser {
+    [CmdletBinding()]
+    Param (
+        [Parameter()]
+        [string] $TaskUser
+    )
+
+    $Candidate = $TaskUser
+    $Source    = 'the -TaskUser parameter'
+
+    If (-Not $Candidate) {
+        $Candidate = [string]((Get-CimInstance -ClassName Win32_ComputerSystem -ErrorAction Stop).UserName)
+        $Source    = 'the logged-on console user'
+    }
+    If (-Not $Candidate) {
+        $Candidate = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name
+        $Source    = 'the current Windows identity'
+    }
+    If ($Candidate -match '(^|\\)(SYSTEM|LOCAL SERVICE|NETWORK SERVICE)$' -Or $Candidate -match '\$$') {
+        Throw "Resolved task account '$Candidate' (from $Source) is a service or machine account. Pass -TaskUser DOMAIN\username with the standard account the tasks should run as."
+    }
+
+    Write-Log -Message "Scheduled tasks will run as: $Candidate (taken from $Source)."
+    Return $Candidate
+}
+
+<#
+.SYNOPSIS
+    Finds where the task account will get ANTHROPIC_API_KEY from, without using the
+    elevated (admin) session's own environment.
+
+.DESCRIPTION
+    Checks the Machine environment first, then the target user's User environment through
+    their registry hive (HKEY_USERS\<SID>\Environment). The hive is only loaded while that
+    user is logged on, which is the case for an interactive task anyway.
+
+.PARAMETER UserId
+    DOMAIN\username the task will run as.
+
+.OUTPUTS
+    [string] A description of where the key was found, or $Null if it was not found.
+#>
+Function Get-ApiKeySource {
+    [CmdletBinding()]
+    Param (
+        [Parameter(Mandatory = $True)]
+        [ValidateNotNullOrEmpty()]
+        [string] $UserId
+    )
+
+    If ([System.Environment]::GetEnvironmentVariable('ANTHROPIC_API_KEY', 'Machine')) {
+        Return 'the Machine environment'
+    }
+
+    Try {
+        $Sid  = (New-Object System.Security.Principal.NTAccount($UserId)).Translate([System.Security.Principal.SecurityIdentifier]).Value
+        $Item = Get-ItemProperty -LiteralPath "Registry::HKEY_USERS\$Sid\Environment" -Name 'ANTHROPIC_API_KEY' -ErrorAction Stop
+        If ($Item.ANTHROPIC_API_KEY) {
+            Return "the User environment of $UserId"
+        }
+    }
+    Catch {
+        Write-Log -Message "Could not find the key in the User environment of ${UserId}: $($_.Exception.Message)" -Severity 2
+    }
+
+    Return $Null
+}
+
+<#
+.SYNOPSIS
+    Registers (or overwrites) a scheduled task under \ShareXRename\ for the given user and checks it landed.
 
 .PARAMETER TaskName
     Task name.
@@ -838,6 +940,9 @@ Function Start-ClipboardWatcher {
 
 .PARAMETER Description
     Task description.
+
+.PARAMETER UserId
+    DOMAIN\username the task runs as (see Resolve-TaskUser).
 #>
 Function Register-ShareXTask {
     [CmdletBinding(SupportsShouldProcess)]
@@ -858,7 +963,11 @@ Function Register-ShareXTask {
 
         [Parameter(Mandatory = $True)]
         [ValidateNotNullOrEmpty()]
-        [string] $Description
+        [string] $Description,
+
+        [Parameter(Mandatory = $True)]
+        [ValidateNotNullOrEmpty()]
+        [string] $UserId
     )
 
     Assert-Elevated
@@ -866,8 +975,8 @@ Function Register-ShareXTask {
         Throw 'Cannot find this script on disk. Save it as a .ps1 file and run it from there.'
     }
 
-    $Action    = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument $Arguments
-    $Principal = New-ScheduledTaskPrincipal -UserId "$env:USERDOMAIN\$env:USERNAME" -LogonType Interactive -RunLevel Limited
+    $Action    = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument $Arguments -ErrorAction Stop
+    $Principal = New-ScheduledTaskPrincipal -UserId $UserId -LogonType Interactive -RunLevel Limited -ErrorAction Stop
 
     $RegisterParams = @{
         TaskName    = $TaskName
@@ -878,11 +987,15 @@ Function Register-ShareXTask {
         Principal   = $Principal
         Description = $Description
         Force       = $True
+        ErrorAction = 'Stop'
     }
 
     If ($PSCmdlet.ShouldProcess("\ShareXRename\$TaskName", 'Register scheduled task')) {
         Register-ScheduledTask @RegisterParams | Out-Null
-        Write-Log -Message "Scheduled task registered: \ShareXRename\$TaskName"
+
+        # Confirm it really exists: the ScheduledTasks cmdlets can report an error without stopping the script
+        $Registered = Get-ScheduledTask -TaskPath '\ShareXRename\' -TaskName $TaskName -ErrorAction Stop
+        Write-Log -Message "Scheduled task registered and verified: \ShareXRename\$TaskName (runs as $UserId, state $($Registered.State))"
     }
 }
 
@@ -894,14 +1007,26 @@ Try {
     Test-PowerShellVersion -NoPrompt $Unattended.IsPresent
     $Mode = $PSCmdlet.ParameterSetName
 
+    # Only bake a folder or model into a task if it was supplied explicitly. Otherwise the task
+    # (running as the standard user) works out its own default. The elevated admin session's
+    # profile folder must never leak into the task.
+    $FolderArgument = ''
+    If ($PSBoundParameters.ContainsKey('ScreenshotFolder')) {
+        $FolderArgument = " -ScreenshotFolder `"$ScreenshotFolder`""
+    }
+    $ModelArgument = ''
+    If ($PSBoundParameters.ContainsKey('Model')) {
+        $ModelArgument = " -Model `"$Model`""
+    }
+
     # ---- Mode: register the scheduled rename task ----------------------------
     If ($Mode -eq 'Schedule') {
-        $KeyFound = 'User', 'Machine' |
-            ForEach-Object { [System.Environment]::GetEnvironmentVariable('ANTHROPIC_API_KEY', $_) } |
-            Where-Object { $_ }
-        If (-Not $KeyFound) {
-            Throw 'Scheduled runs read ANTHROPIC_API_KEY from the User or Machine environment, and it is not set. Set it first, for example: [Environment]::SetEnvironmentVariable(''ANTHROPIC_API_KEY'', ''<key>'', ''User'')'
+        $RunAs     = Resolve-TaskUser -TaskUser $TaskUser
+        $KeySource = Get-ApiKeySource -UserId $RunAs
+        If (-Not $KeySource) {
+            Throw "ANTHROPIC_API_KEY is not visible to $RunAs. Log on as that account and, in a NON-elevated window, run: [Environment]::SetEnvironmentVariable('ANTHROPIC_API_KEY', '<your key>', 'User')  (or set it at Machine scope from this session), then run this again."
         }
+        Write-Log -Message "The task will use the API key from $KeySource."
 
         # Spread the runs evenly from the start hour towards midnight
         $IntervalHours = 0
@@ -924,17 +1049,17 @@ Try {
 
         $Triggers = @(
             ForEach ($Hour in $RunHours) {
-                New-ScheduledTaskTrigger -Weekly -DaysOfWeek $ScheduleDays -At (Get-Date -Hour $Hour -Minute 0 -Second 0)
+                New-ScheduledTaskTrigger -Weekly -DaysOfWeek $ScheduleDays -At (Get-Date -Hour $Hour -Minute 0 -Second 0) -ErrorAction Stop
             }
         )
         $Settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries `
             -StartWhenAvailable -RunOnlyIfNetworkAvailable -MultipleInstances IgnoreNew `
-            -ExecutionTimeLimit (New-TimeSpan -Hours 2)
-        $Arguments = "-NoProfile -NonInteractive -ExecutionPolicy Bypass -File `"$Script:ScriptPath`" -Unattended " +
-            "-ScreenshotFolder `"$ScreenshotFolder`" -Model `"$Model`""
+            -ExecutionTimeLimit (New-TimeSpan -Hours 2) -ErrorAction Stop
+        $Arguments = "-NoProfile -NonInteractive -ExecutionPolicy Bypass -File `"$Script:ScriptPath`" -Unattended" +
+            $FolderArgument + $ModelArgument
 
         Register-ShareXTask -TaskName $TaskName -Arguments $Arguments -Triggers $Triggers -Settings $Settings `
-            -Description 'Renames ShareX screenshots using Claude. Managed by Invoke-ShareXRename.ps1.'
+            -UserId $RunAs -Description 'Renames ShareX screenshots using Claude. Managed by Invoke-ShareXRename.ps1.'
 
         Write-Log -Message "Runs on: $($ScheduleDays -join ', ')"
         Write-Log -Message "Run times: $(($RunHours | ForEach-Object { '{0:D2}:00' -f $_ }) -join ', ')"
@@ -945,18 +1070,20 @@ Try {
     # ---- Mode: register the clipboard watcher logon task ---------------------
     If ($Mode -eq 'WatcherTask') {
         $WatcherTaskName = 'ShareXClipboardWatcher'
-        $Triggers  = @(New-ScheduledTaskTrigger -AtLogOn -User "$env:USERDOMAIN\$env:USERNAME")
+        $RunAs     = Resolve-TaskUser -TaskUser $TaskUser
+        $Triggers  = @(New-ScheduledTaskTrigger -AtLogOn -User $RunAs -ErrorAction Stop)
         $Settings  = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries `
             -StartWhenAvailable -MultipleInstances IgnoreNew -ExecutionTimeLimit ([TimeSpan]::Zero) `
-            -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 1)
+            -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 1) -ErrorAction Stop
         $Arguments = "-NoProfile -STA -WindowStyle Hidden -NonInteractive -ExecutionPolicy Bypass " +
-            "-File `"$Script:ScriptPath`" -WatchClipboard -Unattended -ScreenshotFolder `"$ScreenshotFolder`""
+            "-File `"$Script:ScriptPath`" -WatchClipboard -Unattended" +
+            $FolderArgument
 
         Register-ShareXTask -TaskName $WatcherTaskName -Arguments $Arguments -Triggers $Triggers -Settings $Settings `
-            -Description 'Saves every clipboard image to the ShareX folder so no snip is lost. Managed by Invoke-ShareXRename.ps1.'
+            -UserId $RunAs -Description 'Saves every clipboard image to the ShareX folder so no snip is lost. Managed by Invoke-ShareXRename.ps1.'
 
         If (-Not $WhatIfPreference) {
-            Start-ScheduledTask -TaskPath '\ShareXRename\' -TaskName $WatcherTaskName
+            Start-ScheduledTask -TaskPath '\ShareXRename\' -TaskName $WatcherTaskName -ErrorAction Stop
             Write-Log -Message 'Clipboard watcher task started. It will also start at every logon.'
         }
         Return
