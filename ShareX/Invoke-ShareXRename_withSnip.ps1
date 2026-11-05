@@ -231,11 +231,13 @@ Function Write-Log {
     }
 
     $Now  = Get-Date
-    $Bias = [int]([System.TimeZoneInfo]::Local.GetUtcOffset($Now).TotalMinutes * -1)
+        # CMTrace wants an explicit sign: "+600" or "-600". A negative bias already carries its minus.
+    $BiasText = If ($Bias -ge 0) { "+$Bias" } Else { "$Bias" }
 
-    $LogLine = '<![LOG[{0}]LOG]!><time="{1}+{2}" date="{3}" component="{4}" context="" type="{5}" thread="{6}" file="">' -f
-        $Message, $Now.ToString('HH:mm:ss.fff'), $Bias, $Now.ToString('MM-dd-yyyy'), $Component, $Severity, $PID
+    $LogLine = '<![LOG[{0}]LOG]!><time="{1}{2}" date="{3}" component="{4}" context="" type="{5}" thread="{6}" file="">' -f
+        $Message, $Now.ToString('HH:mm:ss.fff'), $BiasText, $Now.ToString('MM-dd-yyyy'), $Component, $Severity, $PID
 
+        
     $Colour = Switch ($Severity) { 1 { 'Gray' } 2 { 'Yellow' } 3 { 'Red' } }
     Write-Host ('[{0}] {1}' -f $Now.ToString('HH:mm:ss'), $Message) -ForegroundColor $Colour
 
