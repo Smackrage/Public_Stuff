@@ -114,8 +114,8 @@
 
 .NOTES
     Author:  Marty Smith
-    Date:    2026-11-05
-    Version: 3.2
+    Date:    2026-11-10
+    Version: 3.4
     Requires: Windows PowerShell 5.1, internet access to api.anthropic.com.
     The script is pure ASCII. Save it as a .ps1 file before using the task options.
 #>
@@ -124,7 +124,7 @@
 Param (
     [Parameter()]
     [ValidateNotNullOrEmpty()]
-    [string] $ScreenshotFolder = "$env:USERPROFILE\Documents\ShareX\Screenshots",
+    [string] $ScreenshotFolder = (Join-Path -Path $(If ([Environment]::GetFolderPath('MyDocuments')) { [Environment]::GetFolderPath('MyDocuments') } Else { "$env:USERPROFILE\Documents" }) -ChildPath 'ShareX\Screenshots'),
 
     [Parameter()]
     [switch] $Unattended,
@@ -231,13 +231,11 @@ Function Write-Log {
     }
 
     $Now  = Get-Date
-        # CMTrace wants an explicit sign: "+600" or "-600". A negative bias already carries its minus.
-    $BiasText = If ($Bias -ge 0) { "+$Bias" } Else { "$Bias" }
+    $Bias = [int]([System.TimeZoneInfo]::Local.GetUtcOffset($Now).TotalMinutes * -1)
 
-    $LogLine = '<![LOG[{0}]LOG]!><time="{1}{2}" date="{3}" component="{4}" context="" type="{5}" thread="{6}" file="">' -f
-        $Message, $Now.ToString('HH:mm:ss.fff'), $BiasText, $Now.ToString('MM-dd-yyyy'), $Component, $Severity, $PID
+    $LogLine = '<![LOG[{0}]LOG]!><time="{1}+{2}" date="{3}" component="{4}" context="" type="{5}" thread="{6}" file="">' -f
+        $Message, $Now.ToString('HH:mm:ss.fff'), $Bias, $Now.ToString('MM-dd-yyyy'), $Component, $Severity, $PID
 
-        
     $Colour = Switch ($Severity) { 1 { 'Gray' } 2 { 'Yellow' } 3 { 'Red' } }
     Write-Host ('[{0}] {1}' -f $Now.ToString('HH:mm:ss'), $Message) -ForegroundColor $Colour
 
@@ -1019,6 +1017,16 @@ Try {
     $ModelArgument = ''
     If ($PSBoundParameters.ContainsKey('Model')) {
         $ModelArgument = " -Model `"$Model`""
+    }
+
+        # Until the real log folder is known, keep a small fallback log so an early failure (for
+    # example "folder not found" in a scheduled run) is never silent.
+    If ($Mode -in 'Rename', 'Retry', 'Watch') {
+        $FallbackRoot = [Environment]::GetFolderPath('LocalApplicationData')
+        If (-Not $FallbackRoot) {
+            $FallbackRoot = [System.IO.Path]::GetTempPath()
+        }
+        $Script:LogFile = Join-Path -Path $FallbackRoot -ChildPath 'ShareXRename\ShareXRename_Startup.log'
     }
 
     # ---- Mode: register the scheduled rename task ----------------------------
